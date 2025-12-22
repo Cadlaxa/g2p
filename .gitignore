@@ -1,0 +1,7 @@
+__pycache__/
+logs/
+data/*
+*.log
+*.ckpt
+*.onnx
+*.oudep

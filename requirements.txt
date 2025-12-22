@@ -1,0 +1,21 @@
+numpy
+tqdm
+omegaconf
+hydra-core
+editdistance
+lightning
+onnxruntime
+tensorboard
+
+muon-optimizer @ git+https://github.com/KellerJordan/Muon
+
+--find-links https://download.pytorch.org/whl/torch/
+torch==2.8.0+cu128; sys_platform == "linux"
+torch==2.8.0+cu128; sys_platform == "win32"
+torch==2.8.0; sys_platform == "darwin"
+
+--find-links https://k2-fsa.github.io/k2/cuda.html
+--find-links https://k2-fsa.github.io/k2/cpu.html
+k2==1.24.4.dev20250807+cuda12.8.torch2.8.0; sys_platform == "linux"
+k2==1.24.4.dev20250807+cpu.torch2.8.0; sys_platform == "win32"
+k2==1.24.4.dev20250807+cpu.torch2.8.0; sys_platform == "darwin"
