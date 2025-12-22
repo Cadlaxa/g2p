@@ -1,0 +1,17 @@
+defaults:
+  - cfg
+  - override symbols: arpabet_ds
+  - _self_
+dataset:
+  path: "data/ds_cmudict-07b.txt"
+train:
+  epochs: 240
+export:
+  oudep:
+    id: "g2p-ds-cmudict-07b"
+    description: "G2P based on ds_cmudict-07b.txt"
+    version: "1.0"
+  config:
+    convert_grapheme_input: "to_lower"
+    convert_phoneme_output: "as_is"
+    remove_phoneme_stress: false

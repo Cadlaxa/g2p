@@ -1,0 +1,98 @@
+hydra:
+  run:
+    dir: logs/${now:%Y%m%d}_${now:%H%M%S}
+  sweep:
+    dir: logs/${now:%Y%m%d}_${now:%H%M%S}_sweep
+    subdir: ${hydra.job.num}
+
+defaults:
+  - symbols: arpabet
+  - _self_
+
+dataset:
+  _target_: dataset.SphinxDataset
+  path: "data/cmudict-0.7b"
+  comment_prefix: ";;;"
+  remove_word_digits: true
+  remove_phoneme_digits: false
+  graphemes: ${symbols.graphemes}
+  phonemes: ${symbols.phonemes}
+
+model:
+  _target_: model.G2p
+  max_len: 48
+  encoder:
+    _target_: model.LstmEncoder
+    num_graphemes: ${symbols.num_graphemes}
+    d_model: 64
+    d_hidden: 128
+    num_layers: 3
+    dropout: 0.1
+  decoder:
+    _target_: model.Decoder
+    num_phonemes: ${symbols.num_phonemes}
+    d_model: 64
+    d_hidden: 128
+    num_layers: 1
+    dropout: 0.1
+  joint:
+    _target_: model.MHAJoint
+    num_phonemes: ${symbols.num_phonemes}
+    d_enc: ${model.encoder.d_model}
+    d_dec: ${model.decoder.d_model}
+    d_hidden: 128
+    dropout: 0.1
+    max_len: ${model.max_len}
+
+lr_schedulers:
+  exponential_lr:
+    _target_: torch.optim.lr_scheduler.ExponentialLR
+    gamma: 0.99
+  reduce_lr_on_plateau:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    factor: 0.8
+    patience: 3
+    min_lr: 1e-6
+  one_cycle_lr:
+    _target_: torch.optim.lr_scheduler.OneCycleLR
+    _convert_: all
+    max_lr:
+      - ${train.muon_lr}
+      - ${train.adam_lr}
+    total_steps: ${train.epochs}
+    pct_start: 0.2
+    cycle_momentum: false
+  cosine_annealing_lr:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: ${train.epochs}
+
+train:
+  accelerator: "gpu"
+  eval_split: 0.05
+  batch_size: 1024
+  epochs: 200
+  muon_lr: 0.02
+  adam_lr: 0.002
+  weight_decay: 1e-6
+  lr_scheduler: ${lr_schedulers.one_cycle_lr}
+  ilm_loss_weight: 0.5
+  ilm_scheduled_sampling_ratio: 0.1
+  grad_clip: 5.0
+  save_interval: 20
+  seed: 42
+  logs_stressless_error_rates: true
+  print_debug_preview: false
+
+export:
+  oudep:
+    id: "g2p-cmudict-07b"
+    description: "G2P based on CMU Pronouncing Dictionary 0.7b"
+    version: "1.0"
+    loader: "G2pPackV2Loader"
+  config:
+    symbols:
+      graphemes: ${symbols.graphemes}
+      phonemes: ${symbols.phonemes}
+    convert_grapheme_input: "to_upper"
+    convert_phoneme_output: "to_lower"
+    remove_phoneme_stress: true
