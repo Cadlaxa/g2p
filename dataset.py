@@ -34,6 +34,7 @@ class SphinxDataset(Dataset):
         comment_prefix=";;;",
         remove_word_digits=True,
         remove_phoneme_digits=True,
+        lowercase_word=True,
     ):
         self.graphemes = graphemes
         assert len(self.graphemes) > 4
@@ -48,7 +49,11 @@ class SphinxDataset(Dataset):
         self.phoneme_indexs = {v: i for i, v in enumerate(self.phonemes)}
 
         self.entries = self.load_dict(
-            path, comment_prefix, remove_word_digits, remove_phoneme_digits
+            path,
+            comment_prefix,
+            remove_word_digits,
+            remove_phoneme_digits,
+            lowercase_word,
         )
 
     def __len__(self):
@@ -57,19 +62,15 @@ class SphinxDataset(Dataset):
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        src, tgt = self.entries[idx]
-        src = torch.tensor(
-            [BOS_IDX] + [self.grapheme_indexs.get(s, UNK_IDX) for s in src] + [EOS_IDX],
-            dtype=torch.int32,
-        )
-        tgt = torch.tensor(
-            [self.phoneme_indexs.get(s, UNK_IDX) for s in tgt] + [EOS_IDX],
-            dtype=torch.int32,
-        )
-        return src, tgt
+        return self.entries[idx]
 
     def load_dict(
-        self, path, comment_prefix, remove_word_digits, remove_phoneme_digits
+        self,
+        path,
+        comment_prefix,
+        remove_word_digits,
+        remove_phoneme_digits,
+        lowercase_word,
     ):
         rm_digit = re.compile(r"\(\d+\)$|\d+$")
         entries = []
@@ -77,7 +78,7 @@ class SphinxDataset(Dataset):
         ignored_phonemes = set()
 
         with open(path, "r", encoding="utf8") as f:
-            for line in f.readlines():
+            for line in f:
                 line = line.strip()
                 if line == "" or line.startswith(comment_prefix):
                     continue
@@ -90,6 +91,8 @@ class SphinxDataset(Dataset):
                 pron = parts[1:]
                 if remove_word_digits:
                     word = rm_digit.sub("", word)
+                if lowercase_word:
+                    word = word.lower()
                 if remove_phoneme_digits:
                     pron = [rm_digit.sub("", p) for p in pron]
 
@@ -99,7 +102,18 @@ class SphinxDataset(Dataset):
                 for p in pron:
                     if p not in self.phoneme_indexs:
                         ignored_phonemes.add(p)
-                entries.append((word, pron))
+
+                src_tensor = torch.tensor(
+                    [BOS_IDX]
+                    + [self.grapheme_indexs.get(s, UNK_IDX) for s in word]
+                    + [EOS_IDX],
+                    dtype=torch.int32,
+                )
+                tgt_tensor = torch.tensor(
+                    [self.phoneme_indexs.get(s, UNK_IDX) for s in pron] + [EOS_IDX],
+                    dtype=torch.int32,
+                )
+                entries.append((src_tensor, tgt_tensor))
 
         print("graphemes: {}".format(", ".join(self.graphemes)))
         print("ignored graphemes: {}".format(", ".join(sorted(ignored_graphemes))))

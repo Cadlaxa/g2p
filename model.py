@@ -32,17 +32,13 @@ class Joint(nn.Module):
     def forward(self, enc_state: Tensor, dec_state: Tensor, t_dec: Tensor = None):
         assert enc_state.dim() == 3
         assert dec_state.dim() == 3
-        T = enc_state.size(1)
-        U = dec_state.size(1)
-        enc_state = enc_state.unsqueeze(2)
-        dec_state = dec_state.unsqueeze(1)
-        enc_state = enc_state.expand([-1, -1, U, -1])
-        dec_state = dec_state.expand([-1, T, -1, -1])
-        concat_state = torch.cat((enc_state, dec_state), dim=-1)
-        outputs = self.forward_layer(concat_state)
-        outputs = self.tanh(outputs)
-        outputs = self.project_layer(outputs)
-        return outputs
+        d_enc = enc_state.size(-1)
+        w_enc = self.forward_layer.weight[:, :d_enc]
+        w_dec = self.forward_layer.weight[:, d_enc:]
+        enc_proj = F.linear(enc_state, w_enc, self.forward_layer.bias).unsqueeze(2)
+        dec_proj = F.linear(dec_state, w_dec).unsqueeze(1)
+        outputs = self.tanh(enc_proj + dec_proj)
+        return self.project_layer(outputs)
 
 
 class PositionalEncoding(nn.Module):
@@ -61,7 +57,6 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x: Tensor, offset: Tensor = None) -> Tensor:
         if offset is not None:
-            # code path for decode steps
             assert x.size(1) == 1
             x = x + torch.gather(
                 self.pe.expand(x.size(0), -1, -1), 1, offset.unsqueeze(2)
@@ -114,16 +109,14 @@ class MHAJoint(nn.Module):
         context, _ = self.attn(q, k, v)
         context = self.ln(context + dec_with_pe)
 
-        T = enc_state.size(1)
-        U = dec_state.size(1)
-        enc_state = enc_state.unsqueeze(2).expand([-1, -1, U, -1])
-        context = context.unsqueeze(1).expand([-1, T, -1, -1])
+        d_enc = enc_state.size(-1)
+        w_enc = self.forward_layer.weight[:, :d_enc]
+        w_dec = self.forward_layer.weight[:, d_enc:]
+        enc_proj = F.linear(enc_state, w_enc, self.forward_layer.bias).unsqueeze(2)
+        ctx_proj = F.linear(context, w_dec).unsqueeze(1)
 
-        concat_state = torch.cat((enc_state, context), dim=-1)
-        outputs = self.forward_layer(concat_state)
-        outputs = torch.tanh(outputs)
-        outputs = self.project_layer(outputs)
-        return outputs
+        outputs = self.tanh(enc_proj + ctx_proj)
+        return self.project_layer(outputs)
 
 
 class LstmEncoder(nn.Module):
@@ -232,17 +225,14 @@ class G2p(nn.Module):
         device = src.device
         B = src.shape[0]
         enc_state = self.encoder(src)
-        tgt = torch.full((B, self.max_len), BOS_IDX, dtype=torch.int32)
+        tgt = torch.full((B, self.max_len), BOS_IDX, dtype=torch.int32, device=device)
         hc = torch.zeros(
-            (2, self.decoder.num_layers, B, self.decoder.d_hidden), dtype=torch.float32
+            (2, self.decoder.num_layers, B, self.decoder.d_hidden),
+            dtype=torch.float32,
+            device=device,
         )
-        ts = torch.zeros((B, 2), dtype=torch.int32)
-        return (
-            tgt.to(device),
-            enc_state,
-            hc.to(device),
-            ts.to(device),
-        )
+        ts = torch.zeros((B, 2), dtype=torch.int32, device=device)
+        return tgt, enc_state, hc, ts
 
     def decode_step(self, tgt, enc_state, src_lengths, hc, ts):
         h, c = hc[0], hc[1]
@@ -252,19 +242,22 @@ class G2p(nn.Module):
         step_dec_state, new_h, new_c = self.decoder.step(input, h, c)
         end_of_src = torch.ge(t_src, src_lengths)  # (B,)
         safe_t_src = torch.min(t_src, src_lengths - 1)
+        gathered_enc = enc_state.gather(
+            dim=1, index=safe_t_src.view(B, 1, 1).expand(B, 1, enc_state.size(-1))
+        )
         step_enc_state = torch.where(
             end_of_src.view(B, 1, 1),
-            torch.zeros((B, 1, enc_state.size(-1))).to(h.device),
-            enc_state.gather(
-                dim=1, index=safe_t_src.view(B, 1, 1).expand(B, 1, enc_state.size(-1))
-            ),
+            torch.zeros_like(gathered_enc),
+            gathered_enc,
         )
 
         logits = self.joint(step_enc_state, step_dec_state, t_tgt.unsqueeze(1))
         pred = torch.argmax(logits, dim=-1).squeeze(1).int()
 
-        is_blank = torch.eq(pred[:, -1], torch.tensor([BLANK_IDX]).to(h.device))
-        is_not_blank = torch.logical_not(is_blank)
+        # Freeze sequences that already emitted <eos> so they advance t_src and exit cleanly
+        has_eos = (tgt == EOS_IDX).any(dim=1)
+        is_blank = (pred[:, -1] == BLANK_IDX) | has_eos
+        is_not_blank = ~is_blank
 
         advance_src = is_blank & ~end_of_src
         advance_tgt = is_not_blank & ~end_of_src
@@ -274,7 +267,6 @@ class G2p(nn.Module):
         h = torch.where(advance_tgt.view(1, -1, 1), new_h, h)
         c = torch.where(advance_tgt.view(1, -1, 1), new_c, c)
 
-        # Only update tgt when advancing target position
         update_indices = t_tgt.unsqueeze(1)
         update_values = torch.where(
             advance_tgt.unsqueeze(1),

@@ -10,6 +10,16 @@ import editdistance
 from dataset import PAD_IDX, UNK_IDX, BOS_IDX, EOS_IDX, special_symbols
 
 
+def _decode_tokens(token_ids: list[int], vocab: list[str]) -> list[str]:
+    out = []
+    for idx in token_ids:
+        if idx == EOS_IDX:
+            break
+        if idx >= 4:
+            out.append(vocab[idx])
+    return out
+
+
 class G2pModule(pl.LightningModule):
     def __init__(
         self,
@@ -26,6 +36,7 @@ class G2pModule(pl.LightningModule):
         phonemes: list[str],
         print_debug_preview: bool,
         logs_stressless_error_rates: bool,
+        train_eval_interval: int = 5,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -42,6 +53,7 @@ class G2pModule(pl.LightningModule):
         self.loss_device = torch.device(loss_device)
         self.print_debug_preview = print_debug_preview
         self.logs_stressless_error_rates = logs_stressless_error_rates
+        self.train_eval_interval = train_eval_interval
 
         self.validation_step_outputs = []
         self.score_min = 1.0
@@ -86,8 +98,9 @@ class G2pModule(pl.LightningModule):
                 "frequency": 1,
             },
         }
-        if lr_scheduler is ReduceLROnPlateau:
+        if isinstance(lr_scheduler, ReduceLROnPlateau):
             result["lr_scheduler"]["monitor"] = "train/sampled_per"
+            self.train_eval_interval = 1
         return result
 
     def training_step(self, batch, batch_idx):
@@ -95,60 +108,69 @@ class G2pModule(pl.LightningModule):
         B, T = src.shape
 
         tgt_in = torch.concat(
-            [torch.full([B, 1], BOS_IDX, device=self.device), tgt], dim=1
+            [torch.full([B, 1], BOS_IDX, device=self.device, dtype=tgt.dtype), tgt],
+            dim=1,
         )
 
         ilm_loss = torch.tensor(0.0, device=self.device)
-        if self.ilm_loss_weight > 0 or self.ilm_ss_ratio > 0:
-            _, U = tgt_in.shape
-            ilm_dec = self.model.decoder(tgt_in)
-            ilm_enc = torch.zeros(
-                (B, 1, self.model.encoder.d_model), device=self.device
-            )
-            ilm_logits = self.model.joint(ilm_enc, ilm_dec)
-            ilm_logits = ilm_logits.squeeze(1)[:, :-1, :]
-            ilm_logits[:, :, 0:EOS_IDX] = -1e10  # mask special symbols except eos
+        ss_prob = min(self.current_epoch / 50.0, 1.0) * self.ilm_ss_ratio
+        use_ilm = self.ilm_loss_weight > 0 or ss_prob > 0
 
-            # ILM loss: https://arxiv.org/pdf/2102.01380
+        dec_state = None
+        if use_ilm:
+            _, U = tgt_in.shape
+            dec_state = self.model.decoder(tgt_in)
+            ilm_enc = torch.zeros(
+                (B, 1, self.model.encoder.d_model),
+                device=self.device,
+                dtype=dec_state.dtype,
+            )
+            ilm_logits = self.model.joint(ilm_enc, dec_state)
+            ilm_logits = ilm_logits.squeeze(1)[:, :-1, :]
+            ilm_logits[:, :, 0:EOS_IDX] = -1e10
+
+            ilm_mask = torch.arange(U - 1, device=self.device).unsqueeze(0)
+            ilm_mask = ilm_mask < tgt_lengths.unsqueeze(1)
+
             if self.ilm_loss_weight > 0:
                 ilm_loss = F.cross_entropy(
-                    ilm_logits.reshape(-1, ilm_logits.size(-1)),
+                    ilm_logits.float().reshape(-1, ilm_logits.size(-1)),
                     tgt.to(torch.long).view(-1),
                     reduction="none",
                 )
-                ilm_mask = torch.arange(U - 1, device=self.device).unsqueeze(0)
-                ilm_mask = ilm_mask < tgt_lengths.unsqueeze(1)
                 ilm_loss = (
                     ilm_loss * ilm_mask.view(-1).float()
                 ).sum() / ilm_mask.sum().float()
 
-        if self.ilm_ss_ratio > 0:
-            # Scheduled sampling: https://arxiv.org/pdf/2305.15958
-            with torch.no_grad():
-                ilm_logits[:, :, 0 : EOS_IDX + 1] = -1e10  # mask all special symbols
-                p_ilm = torch.log_softmax(ilm_logits, dim=-1).detach()
-                ss_tgt = torch.argmax(p_ilm, dim=-1).int()
-                ss_tgt = ss_tgt.masked_fill(~ilm_mask, PAD_IDX)  # (B, U-1)
-                ss_tgt_in = torch.concat(
-                    [
-                        torch.full([B, 1], BOS_IDX, device=self.device),
-                        ss_tgt,
-                    ],
-                    dim=1,
-                )  # (B, U)
-                ss_prob = min(self.current_epoch / 50.0, 1.0) * self.ilm_ss_ratio
-                select_ss = torch.rand(B, U, device=self.device) < ss_prob
-                tgt_in = torch.where(select_ss, ss_tgt_in, tgt_in)
-                tgt_in = tgt_in.detach()
+            if ss_prob > 0:
+                with torch.no_grad():
+                    ilm_logits[:, :, 0 : EOS_IDX + 1] = -1e10
+                    ss_tgt = torch.argmax(ilm_logits, dim=-1).int()
+                    ss_tgt = ss_tgt.masked_fill(~ilm_mask, PAD_IDX)
+                    ss_tgt_in = torch.concat(
+                        [
+                            torch.full(
+                                [B, 1], BOS_IDX, device=self.device, dtype=tgt.dtype
+                            ),
+                            ss_tgt,
+                        ],
+                        dim=1,
+                    )
+                    select_ss = torch.rand(B, U, device=self.device) < ss_prob
+                    tgt_in = torch.where(select_ss, ss_tgt_in, tgt_in).detach()
+                dec_state = None
 
-        # RNNT loss
-        logits = self.model(src, tgt_in)
+        enc_state = self.model.encoder(src)
+        if dec_state is None:
+            dec_state = self.model.decoder(tgt_in)
+        logits = self.model.joint(enc_state, dec_state)
+
         boundary = torch.zeros((B, 4), dtype=torch.int64, device=self.device)
         boundary[:, 2] = tgt_lengths
         boundary[:, 3] = src_lengths
         boundary = boundary.to(self.loss_device)
         rnnt_loss_val = rnnt_loss(
-            logits=logits.to(self.loss_device),
+            logits=logits.float().to(self.loss_device),
             symbols=tgt.to(self.loss_device),
             termination_symbol=BOS_IDX,
             boundary=boundary,
@@ -165,6 +187,9 @@ class G2pModule(pl.LightningModule):
         return total_loss
 
     def on_train_epoch_end(self):
+        if (self.current_epoch + 1) % self.train_eval_interval != 0:
+            return
+
         train_sampled_loader = self.trainer.datamodule.train_sampled_dataloader()
 
         word_errors = 0
@@ -224,7 +249,8 @@ class G2pModule(pl.LightningModule):
         B = src.shape[0]
 
         tgt_in = torch.concat(
-            [torch.full([B, 1], BOS_IDX, device=self.device), tgt], dim=1
+            [torch.full([B, 1], BOS_IDX, device=self.device, dtype=tgt.dtype), tgt],
+            dim=1,
         )
         logits = self.model(src, tgt_in)
 
@@ -233,7 +259,7 @@ class G2pModule(pl.LightningModule):
         boundary[:, 3] = src_lengths
         boundary = boundary.to(self.loss_device)
         loss = rnnt_loss(
-            logits=logits.to(self.loss_device),
+            logits=logits.float().to(self.loss_device),
             symbols=tgt.to(self.loss_device),
             termination_symbol=BOS_IDX,
             boundary=boundary,
@@ -307,6 +333,10 @@ class G2pModule(pl.LightningModule):
 
         tgt_out = self.model.greedy_decode(src, src_lengths, return_early=True)
 
+        src_cpu = src.cpu().tolist()
+        tgt_cpu = tgt.cpu().tolist()
+        pred_cpu = tgt_out[:, 1:].cpu().tolist()
+
         word_errors = 0
         phoneme_errors = 0
         phoneme_count = 0
@@ -314,18 +344,19 @@ class G2pModule(pl.LightningModule):
         phoneme_errors_stressless = 0
         phoneme_count_stressless = 0
 
-        word_count = src.size(0)
+        word_count = len(src_cpu)
         previews = []
         for i in range(word_count):
-            word = [self.graphemes[idx] for idx in src[i].tolist() if idx >= 4]
-            gold = [self.phonemes[idx] for idx in tgt[i].tolist() if idx >= 4]
-            pred = [self.phonemes[idx] for idx in tgt_out[i][1:].tolist() if idx >= 4]
+            word = _decode_tokens(src_cpu[i], self.graphemes)
+            gold = _decode_tokens(tgt_cpu[i], self.phonemes)
+            pred = _decode_tokens(pred_cpu[i], self.phonemes)
             dis = editdistance.distance(gold, pred)
             phoneme_count += len(gold)
             if dis > 0:
                 word_errors += 1
                 phoneme_errors += dis
-            previews.append((word, gold, pred))
+            if i < 5:
+                previews.append((word, gold, pred))
 
             if self.logs_stressless_error_rates:
                 gold_stressless = [re.sub(r"\d+$", "", p) for p in gold]
@@ -341,7 +372,7 @@ class G2pModule(pl.LightningModule):
             "word_count": word_count,
             "phoneme_errors": phoneme_errors,
             "phoneme_count": phoneme_count,
-            "previews": previews[:5],
+            "previews": previews,
         }
 
         if self.logs_stressless_error_rates:

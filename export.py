@@ -1,4 +1,3 @@
-# coding=utf-8
 import os
 import datetime
 import re
@@ -12,6 +11,17 @@ import torch
 from torch import nn
 import editdistance
 from dataset import BOS_IDX, EOS_IDX
+
+
+def _decode_tokens(token_ids, vocab: list[str]) -> list[str]:
+    out = []
+    for idx in token_ids:
+        idx = int(idx)
+        if idx == EOS_IDX:
+            break
+        if idx >= 4:
+            out.append(vocab[idx])
+    return out
 
 
 class G2pEncode(nn.Module):
@@ -85,6 +95,9 @@ def evaluate_validation_set(ckpt_path: str, training_module, datamodule):
     datamodule.setup(stage="fit")
     val_loader = datamodule.val_dataloader()
 
+    graphemes = training_module.graphemes
+    phonemes = training_module.phonemes
+
     wrong_words = []
     substitution_pairs = Counter()
     insertion_phonemes = Counter()
@@ -105,23 +118,16 @@ def evaluate_validation_set(ckpt_path: str, training_module, datamodule):
                 src, src_lengths, return_early=True
             )
 
-            total_words += src.size(0)
+            src_list = src.tolist()
+            tgt_list = tgt.tolist()
+            pred_list = tgt_out[:, 1:].tolist()
 
-            for i in range(src.size(0)):
-                word = [
-                    cfg.symbols.graphemes[idx] for idx in src[i].tolist() if idx >= 4
-                ]
+            total_words += len(src_list)
 
-                gold = [
-                    cfg.symbols.phonemes[idx] for idx in tgt[i].tolist() if idx >= 4
-                ]
-                # gold = [re.sub(r"\d+$", "", p) for p in gold]
-                pred = [
-                    cfg.symbols.phonemes[idx]
-                    for idx in tgt_out[i][1:].tolist()
-                    if idx >= 4
-                ]
-                # pred = [re.sub(r"\d+$", "", p) for p in pred]
+            for i in range(len(src_list)):
+                word = _decode_tokens(src_list[i], graphemes)
+                gold = _decode_tokens(tgt_list[i], phonemes)
+                pred = _decode_tokens(pred_list[i], phonemes)
 
                 dis = editdistance.distance(gold, pred)
                 total_phoneme_count += len(gold)
@@ -297,8 +303,8 @@ def export(cfg, ckpt_path: str, training_module, datamodule):
         }
         ort_outs = ort_decode_step.run(None, ort_inputs)
         cond, tgt, mem, src_lengths, hc, ts = ort_outs
-    word = [cfg.symbols.graphemes[i.item()] for i in src[0] if i > 3]
-    phs = [cfg.symbols.phonemes[i.item()] for i in tgt[0] if i > 3]
+    word = _decode_tokens(src[0].tolist(), cfg.symbols.graphemes)
+    phs = _decode_tokens(tgt[0][1:].tolist(), cfg.symbols.phonemes)
     print("ONNX test result:", "".join(word), "-".join(phs))
 
     # merge graphs
@@ -320,7 +326,7 @@ def export(cfg, ckpt_path: str, training_module, datamodule):
     total_time = datetime.datetime.now() - start_time
     tgt = ort_outs[0]
     print(f"ONNX seq2seq total time: {total_time.total_seconds()*1000:.2f} ms")
-    phs = [cfg.symbols.phonemes[i.item()] for i in tgt[0] if i > 3]
+    phs = _decode_tokens(tgt[0][1:].tolist(), cfg.symbols.phonemes)
     print("ONNX seq2seq test result:", "".join(word), "-".join(phs))
 
     print("testing single graphemes:")
@@ -330,7 +336,7 @@ def export(cfg, ckpt_path: str, training_module, datamodule):
         }
         ort_outs = ort_session.run(None, ort_inputs)
         tgt = ort_outs[0]
-        phs = [cfg.symbols.phonemes[i.item()] for i in tgt[0] if i > 3]
+        phs = _decode_tokens(tgt[0][1:].tolist(), cfg.symbols.phonemes)
         print(f"  {cfg.symbols.graphemes[i]} -> {'-'.join(phs)}")
 
     if cfg.export.oudep.id:
