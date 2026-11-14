@@ -36,7 +36,8 @@ class G2pModule(pl.LightningModule):
         phonemes: list[str],
         print_debug_preview: bool,
         logs_stressless_error_rates: bool,
-        train_eval_interval: int = 5,
+        train_eval_interval: int = 1,
+        num_preview_words: int = 15,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -54,6 +55,7 @@ class G2pModule(pl.LightningModule):
         self.print_debug_preview = print_debug_preview
         self.logs_stressless_error_rates = logs_stressless_error_rates
         self.train_eval_interval = train_eval_interval
+        self.num_preview_words = num_preview_words
 
         self.validation_step_outputs = []
         self.score_min = 1.0
@@ -179,7 +181,11 @@ class G2pModule(pl.LightningModule):
         total_loss = rnnt_loss_val + self.ilm_loss_weight * ilm_loss
 
         self.log(
-            "train/loss", rnnt_loss_val, on_step=False, on_epoch=True, prog_bar=True
+            "train/loss",
+            rnnt_loss_val,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
         )
         if self.ilm_loss_weight > 0:
             self.log("train/ilm_loss", ilm_loss, on_step=False, on_epoch=True)
@@ -317,11 +323,29 @@ class G2pModule(pl.LightningModule):
             self.log("val/per_stressless", per_stressless * 100, prog_bar=False)
 
         if self.print_debug_preview and len(outputs) > 0:
-            first_results = outputs[0].get("previews", [])
-            self.print("====== Validation Preview ======")
-            for word, gold, pred in first_results:
-                self.print(f"{''.join(word)}: [{'-'.join(gold)}] [{'-'.join(pred)}]")
-            self.print("================================")
+            all_previews = []
+            step = max(1, len(outputs) // 5)
+            for batch_out in outputs[::step]:
+                all_previews.extend(batch_out.get("previews", []))
+            shown_previews = all_previews[: self.num_preview_words]
+
+            lines = ["\n====== Validation Preview ======"]
+            for word, gold, pred in shown_previews:
+                lines.append(f"{''.join(word)}: [{'-'.join(gold)}] [{'-'.join(pred)}]")
+            lines.append("================================")
+            self.print("\n".join(lines))
+
+        train_loss = self.trainer.callback_metrics.get("train/loss_epoch", self.trainer.callback_metrics.get("train/loss", float("nan")))
+        sampled_per = self.trainer.callback_metrics.get("train/sampled_per", float("nan"))
+        self.print(
+            f"Epoch {self.current_epoch:03d}/{self.trainer.max_epochs - 1:03d} | "
+            f"train/loss: {float(train_loss):.4f} | "
+            f"val/loss: {float(avg_loss):.4f} | "
+            f"val/wer: {wer * 100:.2f}% | "
+            f"val/per: {per * 100:.2f}% | "
+            f"val/score: {score * 100:.2f}% (min: {self.score_min * 100:.2f}%) | "
+            f"train/sampled_per: {float(sampled_per):.2f}%"
+        )
 
         self.validation_step_outputs.clear()
 
@@ -355,7 +379,7 @@ class G2pModule(pl.LightningModule):
             if dis > 0:
                 word_errors += 1
                 phoneme_errors += dis
-            if i < 5:
+            if len(previews) < 4 and len(word) >= 2:
                 previews.append((word, gold, pred))
 
             if self.logs_stressless_error_rates:

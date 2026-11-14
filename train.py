@@ -5,7 +5,12 @@ from omegaconf import DictConfig, OmegaConf
 import hydra
 from hydra.core.hydra_config import HydraConfig
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    LearningRateMonitor,
+    Callback,
+    TQDMProgressBar,
+)
 from pytorch_lightning.loggers import TensorBoardLogger
 import k2
 import optuna
@@ -64,6 +69,8 @@ def train(cfg: DictConfig):
         phonemes=OmegaConf.to_object(dataset.phonemes),
         print_debug_preview=cfg.train.print_debug_preview,
         logs_stressless_error_rates=cfg.train.get("logs_stressless_error_rates", False),
+        train_eval_interval=cfg.train.get("train_eval_interval", 1),
+        num_preview_words=cfg.train.get("num_preview_words", 15),
     )
 
     output_dir = HydraConfig.get().runtime.output_dir
@@ -85,8 +92,14 @@ def train(cfg: DictConfig):
     )
     periodic_checkpoint.CHECKPOINT_EQUALS_CHAR = "-"
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
+    progress_bar = TQDMProgressBar(refresh_rate=20)
 
-    callbacks_list = [checkpoint_callback, periodic_checkpoint, lr_monitor]
+    callbacks_list = [
+        checkpoint_callback,
+        periodic_checkpoint,
+        lr_monitor,
+        progress_bar,
+    ]
 
     metrics_callback = MetricsCallback()
     callbacks_list.append(metrics_callback)
@@ -113,7 +126,7 @@ def train(cfg: DictConfig):
         accelerator=cfg.train.accelerator,
         devices=1,
         precision=cfg.train.get("precision", default_precision),
-        check_val_every_n_epoch=cfg.train.get("val_interval", 2),
+        check_val_every_n_epoch=cfg.train.get("val_interval", 1),
         callbacks=callbacks_list,
         logger=tensorboard_logger,
         gradient_clip_val=cfg.train.grad_clip,
@@ -128,19 +141,24 @@ def train(cfg: DictConfig):
 
     # 1. PyTorch 2.6 Bypass: Intercept torch.load for weights_only=False
     _original_load = torch.load
+
     def _patched_load(*args, **kwargs):
-        kwargs['weights_only'] = False
+        kwargs["weights_only"] = False
         return _original_load(*args, **kwargs)
+
     torch.load = _patched_load
 
     # 2. OneCycleLR Step Expansion when resuming
     import torch.optim.lr_scheduler as lr_sched
+
     if hasattr(lr_sched, "OneCycleLR"):
         _orig_get_lr = lr_sched.OneCycleLR.get_lr
+
         def _patched_get_lr(self):
             if self.last_epoch > self.total_steps:
                 self.total_steps = self.last_epoch + 1000
             return _orig_get_lr(self)
+
         lr_sched.OneCycleLR.get_lr = _patched_get_lr
 
     trainer.fit(training_module, datamodule=datamodule, ckpt_path=resume_path)
