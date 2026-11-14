@@ -115,7 +115,7 @@ class MHAJoint(nn.Module):
         enc_proj = F.linear(enc_state, w_enc, self.forward_layer.bias).unsqueeze(2)
         ctx_proj = F.linear(context, w_dec).unsqueeze(1)
 
-        outputs = self.tanh(enc_proj + ctx_proj)
+        outputs = torch.tanh(enc_proj + ctx_proj)
         return self.project_layer(outputs)
 
 
